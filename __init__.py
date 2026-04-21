@@ -17,7 +17,16 @@ they're copy-pastable into other file tools and into chat.
 
 from __future__ import annotations
 
+import email
+import email.message
+import email.policy
+import email.utils
+import imaplib
 import json
+import os
+import re
+import time
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -291,6 +300,307 @@ def _open_source_email(params: dict) -> str:
     )
 
 
+# --- IMAP inbox tools --------------------------------------------------------
+#
+# Reads the tenant's own Dovecot mailbox via IMAP against the internal Docker
+# service name ``dovecot:993`` with IMAPS. Credentials come from the agent's
+# environment (set by provisioning): EMAIL_ADDRESS / EMAIL_PASSWORD /
+# EMAIL_IMAP_HOST / EMAIL_IMAP_PORT. No network egress — traffic stays on the
+# internal ``mpa-mail`` Docker network.
+
+_KNOWN_FOLDERS = ("INBOX", "Drafts", "Sent", "Trash", "Junk")
+_BODY_PREVIEW = 8000
+_IMAP_TIMEOUT = 15
+
+
+@contextmanager
+def _imap():
+    host = os.environ.get("EMAIL_IMAP_HOST", "dovecot")
+    port = int(os.environ.get("EMAIL_IMAP_PORT", "993"))
+    addr = os.environ.get("EMAIL_ADDRESS")
+    pw = os.environ.get("EMAIL_PASSWORD")
+    if not addr or not pw:
+        raise RuntimeError("EMAIL_ADDRESS / EMAIL_PASSWORD not set in the agent environment")
+    conn = imaplib.IMAP4_SSL(host, port, timeout=_IMAP_TIMEOUT)
+    try:
+        conn.login(addr, pw)
+        yield conn
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+
+def _extract_text_body(msg: email.message.EmailMessage) -> str:
+    """Return the best-effort plain-text body from a parsed MIME message."""
+    try:
+        body_part = msg.get_body(preferencelist=("plain", "html"))
+        if body_part is not None:
+            content = body_part.get_content()
+            return content if isinstance(content, str) else str(content)
+    except Exception:
+        pass
+    try:
+        return str(msg.get_payload(decode=True) or "")
+    except Exception:
+        return ""
+
+
+def _list_inbox(params: dict) -> str:
+    folder = str(params.get("folder") or "INBOX")
+    if folder not in _KNOWN_FOLDERS:
+        return json.dumps({"error": f"unknown folder '{folder}'. One of: {list(_KNOWN_FOLDERS)}"})
+
+    from_sender = str(params.get("from_sender") or "").strip()
+    subject = str(params.get("subject") or "").strip()
+    since_raw = str(params.get("since") or "").strip()
+    unread_only = bool(params.get("unread_only"))
+    try:
+        limit = int(params.get("limit") or 50)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    criteria: list[str] = []
+    if unread_only:
+        criteria.append("UNSEEN")
+    if from_sender:
+        # IMAP SEARCH disallows unescaped quotes in astring; keep it simple.
+        if '"' in from_sender:
+            return json.dumps({"error": "from_sender must not contain \""})
+        criteria.append(f'FROM "{from_sender}"')
+    if subject:
+        if '"' in subject:
+            return json.dumps({"error": "subject must not contain \""})
+        criteria.append(f'SUBJECT "{subject}"')
+    if since_raw:
+        try:
+            d = date.fromisoformat(since_raw[:10])
+        except Exception:
+            return json.dumps({"error": "since must be YYYY-MM-DD"})
+        criteria.append(f"SINCE {d.strftime('%d-%b-%Y')}")
+    if not criteria:
+        criteria = ["ALL"]
+
+    try:
+        with _imap() as conn:
+            typ, _ = conn.select(folder, readonly=True)
+            if typ != "OK":
+                return json.dumps({"error": f"SELECT {folder} failed"})
+            typ, data = conn.uid("SEARCH", None, *criteria)
+            if typ != "OK":
+                return json.dumps({"error": "SEARCH failed"})
+            uids_all = (data[0] or b"").split()
+            total = len(uids_all)
+            uids = uids_all[-limit:]
+            if not uids:
+                return json.dumps({"folder": folder, "total": 0, "returned": 0, "messages": []})
+            uids_csv = b",".join(uids).decode()
+            typ, fetched = conn.uid(
+                "FETCH",
+                uids_csv,
+                "(FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID)])",
+            )
+            if typ != "OK":
+                return json.dumps({"error": "FETCH failed"})
+
+            messages: list[dict] = []
+            for raw in fetched:
+                if not isinstance(raw, tuple):
+                    continue
+                meta_bytes, header_bytes = raw
+                meta = meta_bytes.decode(errors="replace") if isinstance(meta_bytes, bytes) else str(meta_bytes)
+                uid_m = re.search(r"UID (\d+)", meta)
+                flags_m = re.search(r"FLAGS \(([^)]*)\)", meta)
+                size_m = re.search(r"RFC822\.SIZE (\d+)", meta)
+                idate_m = re.search(r'INTERNALDATE "([^"]+)"', meta)
+                hmsg = email.message_from_bytes(header_bytes or b"", policy=email.policy.default)
+                messages.append({
+                    "uid": int(uid_m.group(1)) if uid_m else None,
+                    "flags": (flags_m.group(1).split() if flags_m and flags_m.group(1) else []),
+                    "size": int(size_m.group(1)) if size_m else None,
+                    "internal_date": idate_m.group(1) if idate_m else "",
+                    "from": str(hmsg.get("From") or ""),
+                    "to": str(hmsg.get("To") or ""),
+                    "cc": str(hmsg.get("Cc") or ""),
+                    "date": str(hmsg.get("Date") or ""),
+                    "subject": str(hmsg.get("Subject") or ""),
+                    "message_id": str(hmsg.get("Message-Id") or ""),
+                })
+            messages.sort(key=lambda m: m.get("uid") or 0, reverse=True)
+            return json.dumps(
+                {"folder": folder, "total": total, "returned": len(messages), "messages": messages},
+                indent=2, default=str,
+            )
+    except imaplib.IMAP4.error as e:
+        return json.dumps({"error": f"IMAP error: {e}"})
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+
+
+def _read_inbox_message(params: dict) -> str:
+    folder = str(params.get("folder") or "INBOX")
+    if folder not in _KNOWN_FOLDERS:
+        return json.dumps({"error": f"unknown folder '{folder}'. One of: {list(_KNOWN_FOLDERS)}"})
+    try:
+        uid = int(params.get("uid"))
+    except (TypeError, ValueError):
+        return json.dumps({"error": "uid (integer) is required"})
+
+    try:
+        with _imap() as conn:
+            typ, _ = conn.select(folder, readonly=True)
+            if typ != "OK":
+                return json.dumps({"error": f"SELECT {folder} failed"})
+            typ, data = conn.uid("FETCH", str(uid), "(FLAGS BODY.PEEK[])")
+            if typ != "OK" or not data or not isinstance(data[0], tuple):
+                return json.dumps({"error": f"message uid={uid} not found in {folder}"})
+            meta_bytes, raw = data[0]
+            meta = meta_bytes.decode(errors="replace") if isinstance(meta_bytes, bytes) else str(meta_bytes)
+            flags_m = re.search(r"FLAGS \(([^)]*)\)", meta)
+            msg = email.message_from_bytes(raw or b"", policy=email.policy.default)
+            body = _extract_text_body(msg)
+            truncated = len(body) > _BODY_PREVIEW
+            return json.dumps(
+                {
+                    "folder": folder,
+                    "uid": uid,
+                    "flags": (flags_m.group(1).split() if flags_m and flags_m.group(1) else []),
+                    "from": str(msg.get("From") or ""),
+                    "to": str(msg.get("To") or ""),
+                    "cc": str(msg.get("Cc") or ""),
+                    "date": str(msg.get("Date") or ""),
+                    "subject": str(msg.get("Subject") or ""),
+                    "message_id": str(msg.get("Message-Id") or ""),
+                    "in_reply_to": str(msg.get("In-Reply-To") or ""),
+                    "references": str(msg.get("References") or ""),
+                    "body_text": body[:_BODY_PREVIEW],
+                    "body_truncated": truncated,
+                },
+                indent=2, default=str,
+            )
+    except imaplib.IMAP4.error as e:
+        return json.dumps({"error": f"IMAP error: {e}"})
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+
+
+def _quote_original(orig: email.message.EmailMessage) -> str:
+    sender = str(orig.get("From") or "someone")
+    dt = str(orig.get("Date") or "")
+    body = _extract_text_body(orig) or ""
+    quoted = "\n".join("> " + ln for ln in body.splitlines())
+    header = f"On {dt}, {sender} wrote:" if dt else f"{sender} wrote:"
+    return header + "\n" + quoted
+
+
+def _create_draft_reply(params: dict) -> str:
+    folder = str(params.get("folder") or "INBOX")
+    if folder not in _KNOWN_FOLDERS:
+        return json.dumps({"error": f"unknown folder '{folder}'. One of: {list(_KNOWN_FOLDERS)}"})
+    try:
+        uid = int(params.get("uid"))
+    except (TypeError, ValueError):
+        return json.dumps({"error": "uid (integer) is required"})
+    body = str(params.get("body") or "").strip()
+    if not body:
+        return json.dumps({"error": "body is required"})
+    include_quoted = params.get("include_quoted", True)
+    if isinstance(include_quoted, str):
+        include_quoted = include_quoted.lower() not in ("false", "0", "no", "")
+
+    def _as_list(v):
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v] if v.strip() else []
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return []
+    extra_to = _as_list(params.get("extra_to"))
+    extra_cc = _as_list(params.get("extra_cc"))
+
+    from_addr = os.environ.get("EMAIL_ADDRESS")
+    if not from_addr:
+        return json.dumps({"error": "EMAIL_ADDRESS not set — cannot set From: header"})
+
+    try:
+        with _imap() as conn:
+            typ, _ = conn.select(folder, readonly=True)
+            if typ != "OK":
+                return json.dumps({"error": f"SELECT {folder} failed"})
+            typ, data = conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
+            if typ != "OK" or not data or not isinstance(data[0], tuple):
+                return json.dumps({"error": f"message uid={uid} not found in {folder}"})
+            _, raw = data[0]
+            orig = email.message_from_bytes(raw or b"", policy=email.policy.default)
+
+            reply = email.message.EmailMessage(policy=email.policy.SMTP)
+            reply["From"] = from_addr
+
+            reply_to_raw = str(orig.get("Reply-To") or orig.get("From") or "").strip()
+            to_addrs = [reply_to_raw] if reply_to_raw else []
+            to_addrs.extend(extra_to)
+            reply["To"] = ", ".join(to_addrs) if to_addrs else from_addr
+            if extra_cc:
+                reply["Cc"] = ", ".join(extra_cc)
+
+            subj = str(orig.get("Subject") or "")
+            if not re.match(r"^re:\s*", subj, re.IGNORECASE):
+                subj = "Re: " + subj
+            reply["Subject"] = subj
+
+            mid = orig.get("Message-Id")
+            if mid:
+                reply["In-Reply-To"] = mid
+                refs = str(orig.get("References") or "").strip()
+                reply["References"] = (refs + " " + mid).strip() if refs else mid
+
+            reply["Date"] = email.utils.formatdate(localtime=True)
+            reply["Message-Id"] = email.utils.make_msgid(domain=from_addr.split("@")[-1])
+
+            full_body = body + ("\n\n" + _quote_original(orig) if include_quoted else "")
+            reply.set_content(full_body)
+
+            raw_msg = bytes(reply)
+
+            typ, append_data = conn.append(
+                "Drafts",
+                r"(\Draft)",
+                imaplib.Time2Internaldate(time.time()),
+                raw_msg,
+            )
+            if typ != "OK":
+                return json.dumps({"error": f"APPEND failed: {append_data}"})
+
+            new_uid = None
+            for item in (append_data or []):
+                s = item.decode(errors="replace") if isinstance(item, bytes) else str(item)
+                m = re.search(r"APPENDUID (\d+) (\d+)", s)
+                if m:
+                    new_uid = int(m.group(2))
+                    break
+
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "folder": "Drafts",
+                    "uid": new_uid,
+                    "subject": subj,
+                    "to": str(reply["To"]),
+                    "cc": str(reply.get("Cc") or ""),
+                    "bytes": len(raw_msg),
+                    "hint": "Draft saved. Edit/send from your mail client's Drafts folder.",
+                },
+                indent=2, default=str,
+            )
+    except imaplib.IMAP4.error as e:
+        return json.dumps({"error": f"IMAP error: {e}"})
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+
+
 # --- Plugin entry point ------------------------------------------------------
 
 def register(ctx):
@@ -371,6 +681,95 @@ def register(ctx):
         schema=open_schema,
         handler=_open_source_email,
         description="Return the originating raw .eml for a document.",
+    )
+
+    # --- IMAP inbox tools ---------------------------------------------------
+
+    list_inbox_schema = {
+        "name": "list_inbox",
+        "description": (
+            "List messages from the tenant's own mailbox via IMAP. Use this for raw-mailbox queries "
+            "('show me mail from X', 'what's unread', 'recent messages'). For processed invoices/contracts "
+            "prefer search_documents.\n\n"
+            "Examples:\n"
+            "  list_inbox(from_sender='olaf', limit=20)\n"
+            "  list_inbox(unread_only=True)\n"
+            "  list_inbox(folder='Sent', since='2026-04-01')"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "folder":      {"type": "string", "enum": list(_KNOWN_FOLDERS), "description": "Mail folder (default INBOX)."},
+                "from_sender": {"type": "string", "description": "IMAP FROM substring match."},
+                "subject":     {"type": "string", "description": "IMAP SUBJECT substring match."},
+                "since":       {"type": "string", "description": "ISO date lower bound (YYYY-MM-DD) — maps to IMAP SINCE."},
+                "unread_only": {"type": "boolean", "description": "Only return UNSEEN messages."},
+                "limit":       {"type": "integer", "description": "Max results (default 50, clamped to 200). Returns the newest N of the matching set."},
+            },
+        },
+    }
+
+    read_inbox_schema = {
+        "name": "read_inbox_message",
+        "description": (
+            "Return headers + plain-text body (up to ~8 KB) for one message in the tenant's mailbox. "
+            "Pair with list_inbox which returns UIDs.\n\n"
+            "Example: read_inbox_message(uid=12345)"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "folder": {"type": "string", "enum": list(_KNOWN_FOLDERS), "description": "Folder where the UID lives (default INBOX)."},
+                "uid":    {"type": "integer", "description": "IMAP UID from list_inbox."},
+            },
+            "required": ["uid"],
+        },
+    }
+
+    draft_reply_schema = {
+        "name": "create_draft_reply",
+        "description": (
+            "Compose a reply to a message and save it to the user's Drafts folder via IMAP APPEND. "
+            "Does NOT send — the user reviews + sends from their mail client. Threading headers "
+            "(In-Reply-To, References) and a 'Re: ' subject are set automatically. Returns the new draft UID.\n\n"
+            "Example:\n"
+            "  create_draft_reply(uid=12345, body='Dank, ik ga het morgen bekijken.')\n"
+            "  create_draft_reply(uid=12345, body='...', include_quoted=False, extra_cc=['boss@company.nl'])"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "folder":         {"type": "string", "enum": list(_KNOWN_FOLDERS), "description": "Folder of the original message (default INBOX)."},
+                "uid":            {"type": "integer", "description": "IMAP UID of the message being replied to."},
+                "body":           {"type": "string", "description": "Reply body (plain text). Will be placed ABOVE any quoted original."},
+                "include_quoted": {"type": "boolean", "description": "Append the original message as `> `-quoted text (default true)."},
+                "extra_to":       {"type": "array", "items": {"type": "string"}, "description": "Additional To: recipients beyond the original sender."},
+                "extra_cc":       {"type": "array", "items": {"type": "string"}, "description": "Cc: recipients."},
+            },
+            "required": ["uid", "body"],
+        },
+    }
+
+    ctx.register_tool(
+        name="list_inbox",
+        toolset="document-search",
+        schema=list_inbox_schema,
+        handler=_list_inbox,
+        description="List messages from the tenant's IMAP mailbox with optional filters.",
+    )
+    ctx.register_tool(
+        name="read_inbox_message",
+        toolset="document-search",
+        schema=read_inbox_schema,
+        handler=_read_inbox_message,
+        description="Return headers + decoded body for one IMAP message.",
+    )
+    ctx.register_tool(
+        name="create_draft_reply",
+        toolset="document-search",
+        schema=draft_reply_schema,
+        handler=_create_draft_reply,
+        description="Save a reply to the user's Drafts folder (does not send).",
     )
 
     # Register the usage skill so the agent can load it explicitly via
