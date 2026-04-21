@@ -298,7 +298,13 @@ def register(ctx):
         "name": "search_documents",
         "description": (
             "Search the tenant's processed document corpus (invoices, contracts, tickets, generic documents). "
-            "All filters combine with AND. Results are sorted by date descending."
+            "All filters combine with AND. Results are sorted by date descending.\n\n"
+            "Examples:\n"
+            "  search_documents(kind='invoice', vendor='digitalocean', from_date='2026-01-01')\n"
+            "  search_documents(kind='invoice', min_amount=200, limit=5)\n"
+            "  search_documents(kind='contract', query='acme')\n\n"
+            "For the full playbook (when to use which tool, pitfalls, aggregation tips), load the skill "
+            "'document-search:usage'."
         ),
         "parameters": {
             "type": "object",
@@ -321,7 +327,8 @@ def register(ctx):
         "description": (
             "Return the full metadata + extraction result for one document. Accepts the doc path or its "
             "``.metadata.json`` sidecar — agent-root-relative (``shared/invoices/...``), relative to shared/, "
-            "or absolute under /opt/data/workspace/shared."
+            "or absolute under /opt/data/workspace/shared.\n\n"
+            "Example: read_document(path='shared/invoices/2026-03/01/digitalocean-...pdf')"
         ),
         "parameters": {
             "type": "object",
@@ -365,3 +372,13 @@ def register(ctx):
         handler=_open_source_email,
         description="Return the originating raw .eml for a document.",
     )
+
+    # Register the usage skill so the agent can load it explicitly via
+    # ``skill_view('document-search:usage')`` when it needs the playbook.
+    skill_path = Path(__file__).parent / "skills" / "usage" / "SKILL.md"
+    if skill_path.exists():
+        ctx.register_skill(
+            name="usage",
+            path=skill_path,
+            description="How to use document-search — worked examples and pitfalls.",
+        )
