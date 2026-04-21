@@ -1,0 +1,3 @@
+name: document-search
+version: "1.0.0"
+description: Structured search over the tenant's processed document corpus (invoices, contracts, tickets, generic documents) produced by the document-processor.
