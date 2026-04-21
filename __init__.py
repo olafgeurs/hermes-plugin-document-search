@@ -158,7 +158,7 @@ def _safe_path(user_path: str) -> Path:
 
 # --- Tool handlers -----------------------------------------------------------
 
-def _search_documents(params: dict) -> str:
+def _search_documents(params: dict, **_unused) -> str:
     kind = params.get("kind")
     if kind and kind not in _KIND_DIRS:
         return json.dumps({"error": f"unknown kind '{kind}'. One of: {list(_KIND_DIRS)}"})
@@ -216,7 +216,7 @@ def _search_documents(params: dict) -> str:
     )
 
 
-def _read_document(params: dict) -> str:
+def _read_document(params: dict, **_unused) -> str:
     try:
         p = _safe_path(params.get("path", ""))
     except ValueError as e:
@@ -256,7 +256,7 @@ def _read_document(params: dict) -> str:
 _EML_PREVIEW_BYTES = 8000
 
 
-def _open_source_email(params: dict) -> str:
+def _open_source_email(params: dict, **_unused) -> str:
     try:
         p = _safe_path(params.get("path", ""))
     except ValueError as e:
@@ -347,7 +347,7 @@ def _extract_text_body(msg: email.message.EmailMessage) -> str:
         return ""
 
 
-def _list_inbox(params: dict) -> str:
+def _list_inbox(params: dict, **_unused) -> str:
     folder = str(params.get("folder") or "INBOX")
     if folder not in _KNOWN_FOLDERS:
         return json.dumps({"error": f"unknown folder '{folder}'. One of: {list(_KNOWN_FOLDERS)}"})
@@ -439,7 +439,7 @@ def _list_inbox(params: dict) -> str:
         return json.dumps({"error": f"{type(e).__name__}: {e}"})
 
 
-def _read_inbox_message(params: dict) -> str:
+def _read_inbox_message(params: dict, **_unused) -> str:
     folder = str(params.get("folder") or "INBOX")
     if folder not in _KNOWN_FOLDERS:
         return json.dumps({"error": f"unknown folder '{folder}'. One of: {list(_KNOWN_FOLDERS)}"})
@@ -495,7 +495,7 @@ def _quote_original(orig: email.message.EmailMessage) -> str:
     return header + "\n" + quoted
 
 
-def _create_draft_reply(params: dict) -> str:
+def _create_draft_reply(params: dict, **_unused) -> str:
     folder = str(params.get("folder") or "INBOX")
     if folder not in _KNOWN_FOLDERS:
         return json.dumps({"error": f"unknown folder '{folder}'. One of: {list(_KNOWN_FOLDERS)}"})
